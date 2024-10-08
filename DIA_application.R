@@ -5,6 +5,64 @@ library(tidyverse)
 # functions ---------------------------------------------------------------
 removeRowsAllNa <- function(x){x[apply(x, 1, function(y) any(!is.na(y))),]}
 removeColsAllNa <- function(x){x[, apply(x, 2, function(y) any(!is.na(y)))]}
+ulhen_class<-function(tissue_df, fct=3){
+  # tissue_df should be structured as data.frame(SampleType_vector, ProteinMatrix_matrix)
+  j=1
+  clas<-apply(tissue_df[,-1], 2, function(num){
+    t1<-as.data.frame(matrix(ncol=3,nrow = nrow(tissue_df)))
+    colnames(t1)<-c("tissue_type","abundance","classification")
+    t1$tissue_type<-tissue_df[, 1]
+    t1$abundance<-num
+    t1<-t1[order(t1$abundance,decreasing = T),]
+    # class 1(not detected) and 2(tissue enriched)
+    for (i in 1:nrow(tissue_df)){
+      if (t1$abundance[i]<=min(tissue_df[,-1],na.rm = T)) {t1[i,3]<-"not detected"
+      } else if(t1$abundance[i]>=(fct*max(t1$abundance[-i]))) {t1[i,3]<-"tissue enriched"
+      } else {t1[i,3]<-NA}
+    }
+    c12<-t1[!is.na(t1$classification),]
+    
+    # class 3(group enriched)
+    max7<-t1[is.na(t1$classification),]
+    if (nrow(max7)>7){
+      high=max7$abundance[1]
+      for (n in 1:6){
+        high=high+max7$abundance[n+1]
+        nextp=max7$abundance[n+2]
+        # fill=max7$classification[1:(n+1)]
+        if (high/(n+1) >= fct*nextp)  {max7$classification[1:(n+1)]<-"group enriched"}
+      } 
+    } else if (nrow(max7)>=2 & nrow(max7)<=7) {max7$classification<-"group enriched"}
+    
+    #class 4 (expressed in all)
+    if (sum(as.logical(which(t1$abundance<=min(tissue_df[,-c(1,ncol(tissue_df))],na.rm = T))))==0){
+      max7$classification[is.na(max7$classification)]<-"Expressed in all tissues"}
+    c34<-na.omit(max7)
+    
+    #class 5 (tissue enriched) and class 6(mixed)
+    max7_na<-max7[is.na(max7$classification),]
+    if (nrow(max7_na)>=1){
+      for (i in 1:nrow(max7_na)){
+        if(max7_na$abundance[i]>= (fct*mean(t1$abundance))) {max7_na$classification[i]<-"tissue enhanced"
+        } else {max7_na$classification[i]<-"mixed"}
+      }
+    }
+    com_max<-do.call(rbind,list(c12,c34,max7_na))
+    j <<- j+1
+    colnames(com_max)[3]<-colnames(tissue_df)[j]
+    if (j %% 1000 ==0){
+      cat(paste("Processed",j-1,"/",ncol(tissue_df)-1,sep = " "),"\n")}
+    
+    com_max[,c(1,3)]
+    
+    # colnames(class[[j]])[2]<-colnames(tissue_df)[j+1]
+  })
+  
+  print("Finished classification and start merging classification matrix")
+  
+  clas.all<-clas%>% reduce_right(full_join, by = 'tissue_type')
+  return(clas.all)
+}
 
 # 1.Data prepare ----------------------------------------------------------
 ordered_types <- c('N', 'MNG', 'FA', 'FTC', 'PTC', 'PDTC', 'ATC', 'MTC', 'LN')
@@ -159,39 +217,6 @@ p <- ggplot(pepnum, aes(x = Histopathology_type, y = Peptide, fill = Histopathol
 ggsave('TPDlibV2_peptide_number_barplot_v3.pdf', p, width = 10, height = 4.5)
 
 
-
-
-# 3.Correlation -----------------------------------------------------------
-library(corrplot)
-
-identical(info$MS_file_name, colnames(mat_pro)) # TRUE
-info %<>%
-  with_groups(Histopathology_type, mutate,
-              label = str_c(Histopathology_type, 1:length(Histopathology_type)))
-
-
-cors <- cor(mat_pro %>% set_colnames(info$label), use = "pairwise.complete.obs", method = "pearson")
-uptri <- cors[upper.tri(cors)]
-median(uptri) # 0.7534793
-min(uptri) # 0.5231689
-
-# hist(uptri)
-pdf("TPDlibV2_DIA_Pearson_correlation.pdf", width = 15, height = 15)
-corrplot(cors, method = "square", type = "full", order ="original", cl.cex = 1.4, tl.pos = "lt", tl.col = "black", tl.cex = 1.5, tl.srt = 60,
-         col = COL2('PuOr', 10),
-         is.corr = F, col.lim = c(0.5, 1),
-         )
-graphics.off()
-
-dfcor <- data.frame(Pearson = uptri)
-p <- ggplot(dfcor) + 
-  geom_density(aes(x = Pearson)) +
-  geom_vline(aes(xintercept = median(uptri)), color = '#000000', linetype = "dashed", size = 1)+
-  theme_bw() +
-  theme(text = element_text(size = 15))
-ggsave("TPDlibV2_DIA_Pearson_correlation_density.pdf", p, width = 4.5, height = 4.5)
-
-
 # 4.ANOVA -----------------------------------------------------------------
 ## 4.1 ANOVA -----------
 dfimp <- df
@@ -230,149 +255,89 @@ df_anova <- data.frame(Protein = colnames(dfimp)[-(1:2)],
 df_anova$adj.P.anova <- p.adjust(df_anova$P.anova, 'BH')
 rio::export(df_anova, 'TPDlibV2_DIA_ANOVA_50NA.xlsx')
 
-## 4.2 heatmap -----------
-library(pheatmap)
 
-X <- dfimp %>% select(-Histopathology_type) %>% column_to_rownames('MS_file_name') %>%
-  scale() %>% t()
+# 5.Specificity -----------------------------------------------------------
+## 5.1 Classification using Ulhen's method -----
+dfimp <- df[, apply(df, 2, function(y) sum(is.na(y)) / length(y)) < 0.5]
+dfimp[is.na(dfimp)] <- min(mat_pro, na.rm = T) + log2(0.8)
+dfimp_med <- dfimp %>% group_by(Histopathology_type) %>% summarise_if(is.numeric, function(y) median(2^y)) %>% 
+  as.data.frame()
 
-sum(df_anova$adj.P.anova < 0.001) # 1246
-pheatmap(X[df_anova$Protein[df_anova$adj.P.anova < 0.001], ],
-         scale = 'none',
-         cluster_rows = T, cluster_cols = T,
-         # clustering_distance_rows = 'euclidean', clustering_method = 'ward.D2',
-         annotation_col = dfimp %>% column_to_rownames('MS_file_name') %>% select(Histopathology_type),
-         # annotation_colors = anno_color,
-         show_rownames = F, show_colnames = F,
-         fontsize = 9, main = '1246 proteins ANOVA adj.P < 0.001',
-         filename = 'TPDlibV2_DIA_ANOVA_heatmap_50NA.pdf',  width = 10, height = 4,
-)
+# cost ~1min using Intel Core i7-9700K
+sample_classification<-list()
+sample_classification[[1]]<-ulhen_class(dfimp_med[,1:50], fct = 5)
+for (i in 2:floor(ncol(dfimp_med)/50)){
+  sample_classification[[i]]<-ulhen_class(dfimp_med[,c(1,(50*(i-1)+1):(50*i))], fct = 5)
+  cat(paste("Processed",i*50,"/",ncol(dfimp_med) ,sep = " "),"\n")
+}
+sample_classification[[ceiling(ncol(dfimp_med)/50)]]<-ulhen_class(dfimp_med[,c(1,(50*floor(ncol(dfimp_med)/50)+1):ncol(dfimp_med))])
+class_all<-sample_classification%>% reduce_right(full_join, by = "tissue_type")
+colnames(class_all)[1] <- 'Histopathology_type'
+class_all %<>% arrange(Histopathology_type)
+
+class_all_long <- class_all %>% pivot_longer(cols = -Histopathology_type, names_to = 'Protein', values_to = 'Classification')
+tis_enrich <- class_all_long %>% filter(Classification == 'tissue enriched') %>% 
+  arrange(Histopathology_type)
+tis_enrich$`First/Second` <- dfimp_med %>% select(all_of(tis_enrich$Protein)) %>% 
+  apply(2, function(y){
+    y_sorted <- sort(y, decreasing = T)
+    y_sorted[1] / y_sorted[2]
+  })
+tis_enrich %<>%
+  inner_join(df_pro %>%
+               select(Protein.Group, Genes) %>%
+               rename(Protein = Protein.Group, Gene = Genes), .) %>% 
+  arrange(Histopathology_type, desc(`First/Second`))
+tis_enrich %<>% inner_join(df_anova)
+# pro_top5 <- tis_enrich %>% group_by(Histopathology_type) %>% slice(1:5) %>% pull(Protein)
+pro_top5 <- tis_enrich %>% 
+  inner_join(df_anova) %>%
+  filter(adj.P.anova < 0.05) %>% 
+  group_by(Histopathology_type) %>%
+  arrange(adj.P.anova) %>% 
+  slice(1:5) %>% pull(Protein)
+tis_enrich$IsTop5 <- tis_enrich$Protein %in% pro_top5
+
+list(All = class_all_long, TissueEnriched = tis_enrich, ClassMatrix = class_all) %>%
+  rio::export('TPDlibV2_DIA_classification.xlsx')
+
+class_all_long %>% count(Classification)
+# Classification               n
+# Expressed in all tissues 24547
+# group enriched           11354
+# mixed                     3626
+# not detected              5423
+# tissue enriched             59
 
 
-sum(df_anova$adj.P.anova < 10e-8) # 59
-XX <- X[df_anova$Protein[df_anova$adj.P.anova < 10e-8], ]
-rownames(XX) <- df_pro %>% set_rownames(.$Protein.Group) %>%
-  .[rownames(XX), ] %>% # here in the UNIPROT ID input
+
+XX2 <- X[class_all_long %>% filter(Classification == 'tissue enriched') %>% arrange(Histopathology_type) %>% pull(Protein) %>%
+           intersect(pro_top5), ]
+rownames(XX2) <- df_pro %>% set_rownames(.$Protein.Group) %>%
+  .[rownames(XX2), ] %>% # here in the UNIPROT ID input
   unite(Label, Protein.Group, Genes) %>% pull(Label)
-pheatmap(XX,
+
+anno_col <- dfimp %>% column_to_rownames('MS_file_name') %>% select(Histopathology_type)
+anno_row <- class_all_long %>%
+  filter(Classification == 'tissue enriched') %>%
+  arrange(Histopathology_type) %>%
+  left_join(protinfo, by = c(Protein = 'Protein.Group')) %>%
+  filter(Protein %in% pro_top5) %>% 
+  column_to_rownames('Label') %>% select(Histopathology_type)
+mycolors <- RColorBrewer::brewer.pal(6,"PiYG")
+bk <- unique(c(seq(-1.5, 1.5, length=50)))
+pheatmap(XX2,
          scale = 'none',
-         cluster_rows = T, cluster_cols = T,
+         cluster_rows = F, cluster_cols = F,
          clustering_distance_rows = 'euclidean', clustering_method = 'ward.D2',
-         annotation_col = dfimp %>% column_to_rownames('MS_file_name') %>% select(Histopathology_type),
-         # annotation_colors = anno_color,
+         annotation_col = anno_col,
+         annotation_row = anno_row,
+         annotation_colors = list(Histopathology_type = type_colors),
          show_rownames = T, show_colnames = F, border_color = NA,
-         fontsize = 9, main = '59 proteins ANOVA adj.P < 10e-8',
-         filename = 'TPDlibV2_DIA_ANOVA_heatmap_50NA_adjP.pdf',  width = 10, height = 8
+         color = colorRampPalette(rev(mycolors))(50),
+         breaks = bk,
+         gaps_row = cumsum(table(anno_row$Histopathology_type)) %>% .[. != 0],
+         gaps_col = cumsum(table(anno_col$Histopathology_type)),
+         fontsize = 9, main = '59 histopathology-enriched proteins',
+         filename = 'TPDlibV2_DIA_classification_heatmap_top5.pdf',  width = 10, height = 9
 )
-
-## 4.3 specific proteins ------
-library(ggstatsplot)
-paletteer::palettes_d_names
-
-pdf('TPDlibV2_DIA_ANOVA_targets.pdf', width = 5, height = 4)
-# MTC high-expressed proteins
-ggbetweenstats(
-  data = dfimp,
-  x = Histopathology_type,
-  y = A6NCE7,
-  type = "parametric", # ANOVA or Kruskal-Wallis
-  var.equal = T, # ANOVA or Welch ANOVA
-  plot.type = "box", p.adjust.method = 'BH',
-  pairwise.comparisons = F,
-  pairwise.display = "significant",
-  centrality.plotting = F,
-  bf.message = F,
-  palette = "royal",
-  package = "basetheme",
-  xlab = 'Histopathology',
-  ylab = protinfo['A6NCE7', 'Label']
-)
-
-ggbetweenstats(
-  data = dfimp,
-  x = Histopathology_type,
-  y = Q9UI12,
-  type = "parametric", # ANOVA or Kruskal-Wallis
-  var.equal = T, # ANOVA or Welch ANOVA
-  plot.type = "box", p.adjust.method = 'BH',
-  pairwise.comparisons = F,
-  pairwise.display = "significant",
-  centrality.plotting = F,
-  bf.message = F,
-  palette = "royal",
-  package = "basetheme",
-  xlab = 'Histopathology',
-  ylab = protinfo['Q9UI12', 'Label']
-)
-
-ggbetweenstats(
-  data = dfimp,
-  x = Histopathology_type,
-  y = O43488,
-  type = "parametric", # ANOVA or Kruskal-Wallis
-  var.equal = T, # ANOVA or Welch ANOVA
-  plot.type = "box", p.adjust.method = 'BH',
-  pairwise.comparisons = F,
-  pairwise.display = "significant",
-  centrality.plotting = F,
-  bf.message = F,
-  palette = "royal",
-  package = "basetheme",
-  xlab = 'Histopathology',
-  ylab = protinfo['O43488', 'Label']
-)
-
-ggbetweenstats(
-  data = dfimp,
-  x = Histopathology_type,
-  y = P31150,
-  type = "parametric", # ANOVA or Kruskal-Wallis
-  var.equal = T, # ANOVA or Welch ANOVA
-  plot.type = "box", p.adjust.method = 'BH',
-  pairwise.comparisons = F,
-  pairwise.display = "significant",
-  centrality.plotting = F,
-  bf.message = F,
-  palette = "royal",
-  package = "basetheme",
-  xlab = 'Histopathology',
-  ylab = protinfo['P31150', 'Label']
-)
-
-ggbetweenstats(
-  data = dfimp,
-  x = Histopathology_type,
-  y = P61421,
-  type = "parametric", # ANOVA or Kruskal-Wallis
-  var.equal = T, # ANOVA or Welch ANOVA
-  plot.type = "box", p.adjust.method = 'BH',
-  pairwise.comparisons = F,
-  pairwise.display = "significant",
-  centrality.plotting = F,
-  bf.message = F,
-  palette = "royal",
-  package = "basetheme",
-  xlab = 'Histopathology',
-  ylab = protinfo['P61421', 'Label']
-)
-
-ggbetweenstats(
-  data = dfimp,
-  x = Histopathology_type,
-  y = Q8IXB1,
-  type = "parametric", # ANOVA or Kruskal-Wallis
-  var.equal = T, # ANOVA or Welch ANOVA
-  plot.type = "box", p.adjust.method = 'BH',
-  pairwise.comparisons = F,
-  pairwise.display = "significant",
-  centrality.plotting = F,
-  bf.message = F,
-  palette = "royal",
-  package = "basetheme",
-  xlab = 'Histopathology',
-  ylab = protinfo['Q8IXB1', 'Label']
-)
-
-graphics.off()
-
-
